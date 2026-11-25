@@ -111,15 +111,14 @@ impl KeyedStateInputs {
     ///
     /// [`KeyedStateInitError::Cache`] when the cache cannot be opened.
     pub(in crate::consumer) async fn open_cache(&self) -> Result<FjallClient, ConsumerError> {
-        FjallClient::open(&self.config, self.owned.clone())
-            .await
-            .map_err(|error| {
-                KeyedStateInitError::Cache {
-                    message: format!("{error:#}"),
-                    category: error.classify_error(),
-                }
-                .into()
-            })
+        let opened = FjallClient::open(&self.config, self.owned.clone()).await;
+        opened.map_err(|error| {
+            KeyedStateInitError::Cache {
+                message: format!("{error:#}"),
+                category: error.classify_error(),
+            }
+            .into()
+        })
     }
 
     /// The routes for a Cassandra arm. A consumer with a published collection

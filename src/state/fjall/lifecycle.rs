@@ -28,12 +28,8 @@ use tokio::task::spawn_blocking;
 use tracing::warn;
 use uuid::Uuid;
 
-/// The smallest memtable share. It keeps a large assignment from flushing
-/// tiny tables, so memory can exceed the budget past budget / 1 MiB
-/// partitions.
-const MIN_MEMTABLE_SHARE: u64 = 1 << 20;
-
-/// The largest memtable share: fjall's default memtable size.
+/// The largest memtable share. It is fjall's default memtable size, the top of
+/// its recommended range, and the target size of its compacted tables.
 const MAX_MEMTABLE_SHARE: u64 = 64 << 20;
 
 /// A request to create the keyspace for one slot. It holds the slot weakly, so
@@ -96,10 +92,6 @@ impl OwnedPartitions {
     pub(crate) fn set(&self, count: usize) {
         self.0.store(count, Ordering::Relaxed);
     }
-
-    fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
 }
 
 impl From<FjallCellCache> for CacheSlot {
@@ -159,7 +151,7 @@ async fn run(
         select! {
             biased;
             Some(slot) = creates.recv() => {
-                let share = memtable_share(budget, owned.get());
+                let share = memtable_share(budget, owned.0.load(Ordering::Relaxed));
                 let options = options.clone().max_memtable_size(share);
                 create(&database, options, slot, &retire_queue).await;
             }
@@ -210,9 +202,10 @@ pub(super) async fn create(
 }
 
 /// Returns one keyspace's share of the memtable `budget` when `partitions`
-/// keyspaces share it, clamped to between 1 MiB and 64 MiB.
+/// keyspaces share it, at most 64 MiB. The shares never sum to more than the
+/// budget.
 pub(super) fn memtable_share(budget: ByteSize, partitions: usize) -> u64 {
-    (budget.get() / partitions.max(1) as u64).clamp(MIN_MEMTABLE_SHARE, MAX_MEMTABLE_SHARE)
+    (budget.get() / partitions.max(1) as u64).min(MAX_MEMTABLE_SHARE)
 }
 
 /// Deletes `keyspace`. A failure leaves it for the database drop to remove.

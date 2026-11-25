@@ -41,6 +41,9 @@ const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const DEFAULT_READER_CACHE_SIZE: ByteSize = ByteSize::bytes(1 << 20_u32);
 
+/// The smallest memtable budget: fjall's smallest recommended memtable size.
+const MIN_MEMTABLE_SIZE: u64 = 8 << 20;
+
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///
 /// The layer is always present; with no registered descriptors it is inert
@@ -100,18 +103,19 @@ pub struct KeyedStateConfiguration {
     ///
     /// The local keyed-state cache gives each new partition assignment an
     /// equal share of this budget. The share is the budget divided by the
-    /// number of partitions the consumer holds or is about to hold, between
-    /// 1 MiB and 64 MiB. A partition flushes its writes to disk when they
-    /// reach its share, and it keeps that share until it is revoked. Thus
-    /// memory use can exceed the budget after the number of assigned
-    /// partitions grows, or past budget / 1 MiB partitions. A smaller budget
-    /// uses less memory but writes and compacts more files. `None` (the
-    /// default) uses a budget of 192 MiB.
+    /// number of partitions the consumer holds or is about to hold, at most
+    /// 64 MiB. A partition flushes its writes to disk when they reach its
+    /// share, and it keeps that share until it is revoked. Thus memory use
+    /// can exceed the budget after the number of assigned partitions grows.
+    /// A smaller budget uses less memory but writes and compacts more files.
+    /// `None` (the default) uses a budget of 192 MiB. Must be at least 8 MiB,
+    /// the smallest memtable size that the storage engine recommends.
     ///
     /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
     /// positive human-readable byte size such as `256 MiB`. A bare number is
     /// interpreted as bytes.
     #[builder(default = "from_option_env(STATE_MEMTABLE_SIZE_ENV)?")]
+    #[validate(range(min = MIN_MEMTABLE_SIZE))]
     pub memtable_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level

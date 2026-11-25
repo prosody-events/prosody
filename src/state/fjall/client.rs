@@ -58,12 +58,8 @@ impl FjallClient {
     ) -> Result<Self, FjallClientError> {
         let builder = database_builder(config);
         let database = spawn_blocking(move || builder.open()).await??;
-        let (creates, retires) = lifecycle::spawn(
-            database,
-            keyspace_options(),
-            config.memtable_size.unwrap_or(DEFAULT_MEMTABLE_SIZE),
-            owned,
-        );
+        let budget = config.memtable_size.unwrap_or(DEFAULT_MEMTABLE_SIZE);
+        let (creates, retires) = lifecycle::spawn(database, keyspace_options(), budget, owned);
         Ok(Self {
             creates,
             _retires: retires,

@@ -9,6 +9,7 @@ use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use validator::Validate;
 
@@ -49,6 +50,29 @@ fn empty_cache_dir_is_rejected() -> Result<()> {
         "empty cache_dir must fail validation"
     );
     Ok(())
+}
+
+/// Validation accepts a memtable budget exactly when it is at least 8 MiB.
+#[test]
+fn prop_memtable_budget_has_a_minimum() {
+    fn prop(kib: u32, near: bool) -> TestResult {
+        // Half the cases fall within 8 MiB of the minimum.
+        let kib = if near { kib % (16 << 10_u32) } else { kib };
+        let Some(bytes) = NonZeroU64::new(u64::from(kib) << 10_u32) else {
+            return TestResult::discard();
+        };
+        let check = || -> Result<bool> {
+            let config = KeyedStateConfiguration::builder()
+                .memtable_size(Some(ByteSize::new(bytes)))
+                .build()?;
+            Ok(config.validate().is_ok() == (bytes.get() >= 8 << 20_u32))
+        };
+        match check() {
+            Ok(holds) => TestResult::from_bool(holds),
+            Err(error) => TestResult::error(error.to_string()),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(u32, bool) -> TestResult);
 }
 
 /// A zero read-cache TTL would make every cached entry born stale. Validation

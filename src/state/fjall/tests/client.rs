@@ -63,9 +63,9 @@ impl Arbitrary for Trace {
 
 /// Lifecycle model: after the queued creates and deletes run, every live slot
 /// holds a keyspace, the database holds exactly those keyspaces, and no
-/// keyspace name serves two assignments. Revokes often land before the
-/// create runs, so the trace covers creates for assignments that already ended.
-/// The lifecycle task runs creates first, and this model does the same. Each
+/// keyspace name serves two assignments. Revokes often land before the create
+/// runs, so the trace covers creates for assignments that already ended. The
+/// lifecycle task runs creates first, and this model does the same. Each
 /// iteration first deletes the keyspaces that a failed iteration left, so a
 /// shrunk trace starts from an empty database.
 #[test]
@@ -166,18 +166,20 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     Ok(())
 }
 
-/// A memtable share stays between 1 MiB and 64 MiB. Above the floor, the
-/// shares of `partitions` keyspaces never exceed the budget, and together they
-/// leave less than one byte per keyspace unused.
+/// A memtable share is at most 64 MiB. The shares of `partitions` keyspaces
+/// never sum to more than the budget. Below the cap, they leave less than one
+/// byte per keyspace unused.
 #[test]
-fn prop_memtable_shares_fill_the_budget() {
+fn prop_memtable_shares_split_the_budget() {
     fn prop(kib: u32, partitions: u16) -> TestResult {
         let Some(budget) = NonZeroU64::new(u64::from(kib) << 10_u32) else {
             return TestResult::discard();
         };
         let share = memtable_share(ByteSize::new(budget), usize::from(partitions));
-        let exact = budget.get() / u64::from(partitions.max(1));
-        TestResult::from_bool(share == exact.clamp(1 << 20, 64 << 20))
+        let keyspaces = u64::from(partitions.max(1));
+        let unused = budget.get().checked_sub(share * keyspaces);
+        let split = unused.is_some_and(|unused| share == 64 << 20_u32 || unused < keyspaces);
+        TestResult::from_bool(share <= 64 << 20_u32 && split)
     }
     QuickCheck::new().quickcheck(prop as fn(u32, u16) -> TestResult);
 }

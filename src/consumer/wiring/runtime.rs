@@ -49,8 +49,7 @@ pub(in crate::consumer) struct StartupServices<'a> {
     pub(in crate::consumer) heartbeats: HeartbeatRegistry,
     /// The partition managers shared by startup, health, and shutdown.
     pub(in crate::consumer) managers: Arc<Managers>,
-    /// The partition count that the local cache divides its memtable budget
-    /// by.
+    /// The partition count that divides the local cache's memtable budget.
     pub(in crate::consumer) owned: OwnedPartitions,
 }
 

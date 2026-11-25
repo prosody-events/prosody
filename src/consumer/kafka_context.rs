@@ -61,8 +61,7 @@ pub(super) struct ContextHandles {
     /// Publishes the assigned-partition count after each rebalance, so
     /// assignment readiness can be awaited rather than polled.
     pub(super) assignment_tx: watch::Sender<u32>,
-    /// The partition count that the local cache divides its memtable budget
-    /// by.
+    /// The partition count that divides the local cache's memtable budget.
     pub(super) owned: OwnedPartitions,
     /// Telemetry the context and the partitions it creates publish through.
     pub(super) telemetry: TelemetrySender,
