@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ByteSize;
-use crate::state::config::{DEFAULT_MEMTABLE_SIZE, KeyedStateConfiguration};
+use crate::state::config::KeyedStateConfiguration;
 use crate::state::fjall::OwnedPartitions;
 use crate::state::fjall::client::{database_builder, keyspace_options};
 use crate::state::fjall::lifecycle::{create, delete, memtable_share};
@@ -207,7 +207,7 @@ fn config(cache_dir: &Path, cache_size: Option<ByteSize>) -> Result<KeyedStateCo
     Ok(KeyedStateConfiguration::builder()
         .cache_dir(cache_dir.to_path_buf())
         .owned_cache_size(cache_size)
-        .memtable_size(DEFAULT_MEMTABLE_SIZE)
+        .memtable_size(None)
         .build()?)
 }
 

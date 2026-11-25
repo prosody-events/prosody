@@ -41,9 +41,6 @@ const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const DEFAULT_READER_CACHE_SIZE: ByteSize = ByteSize::bytes(1 << 20_u32);
 
-/// Default memtable budget. It gives 1 MiB to each of 192 partitions.
-pub(crate) const DEFAULT_MEMTABLE_SIZE: ByteSize = ByteSize::bytes(192 << 20_u32);
-
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///
 /// The layer is always present; with no registered descriptors it is inert
@@ -108,14 +105,16 @@ pub struct KeyedStateConfiguration {
     /// reach its share, and it keeps that share until it is revoked. Thus
     /// memory use can exceed the budget after the number of assigned
     /// partitions grows, or past budget / 1 MiB partitions. A smaller budget
-    /// uses less memory but writes and compacts more files. Defaults to
-    /// 192 MiB.
+    /// uses less memory but writes and compacts more files. `None` (the
+    /// default) sets no budget. Each partition then uses the storage
+    /// engine's default of 64 MiB, so memory use grows with the number of
+    /// assigned partitions.
     ///
     /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
     /// positive human-readable byte size such as `256 MiB`. A bare number is
     /// interpreted as bytes.
-    #[builder(default = "from_env_with_fallback(STATE_MEMTABLE_SIZE_ENV, DEFAULT_MEMTABLE_SIZE)?")]
-    pub memtable_size: ByteSize,
+    #[builder(default = "from_option_env(STATE_MEMTABLE_SIZE_ENV)?")]
+    pub memtable_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level
     /// client sizes this cache when it composes standalone readers.
