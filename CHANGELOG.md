@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.0](https://github.com/prosody-events/prosody/compare/prosody-v0.9.0...prosody-v0.10.0) (2026-11-25)
+
+
+### Features
+
+* **state:** make the memtable size a budget for all partitions ([#145](https://github.com/prosody-events/prosody/issues/145)) ([4a80b3f](https://github.com/prosody-events/prosody/commit/4a80b3f3c52badec46ee22611a830da1cd627f5e))
+
+
+### Bug Fixes
+
+* **peer:** recover from a held or unspecified peer bind address ([#141](https://github.com/prosody-events/prosody/issues/141)) ([bd5c4ca](https://github.com/prosody-events/prosody/commit/bd5c4caeaff3273c7b604f820cdfb780147dcaa9))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.9.0 to 0.10.0
+
 ## [0.9.0](https://github.com/prosody-events/prosody/compare/prosody-v0.8.0...prosody-v0.9.0) (2026-11-17)
 
 
