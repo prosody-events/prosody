@@ -16,7 +16,6 @@
 
 use super::CacheSlot;
 use super::lifecycle::{self, Pending};
-use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
 use fjall::config::CompressionPolicy;
@@ -50,7 +49,8 @@ impl FjallClient {
     pub async fn open(config: &KeyedStateConfiguration) -> Result<Self, FjallClientError> {
         let builder = database_builder(config);
         let database = spawn_blocking(move || builder.open()).await??;
-        let (creates, retires) = lifecycle::spawn(database, keyspace_options(config.memtable_size));
+        let (creates, retires) =
+            lifecycle::spawn(database, keyspace_options(), config.memtable_size);
         Ok(Self {
             creates,
             _retires: retires,
@@ -83,17 +83,11 @@ pub(super) fn database_builder(config: &KeyedStateConfiguration) -> DatabaseBuil
 ///
 /// Cells are stored raw. fjall compresses data blocks at flush and
 /// compaction, with LZ4 at every level. The explicit [`CompressionPolicy`]
-/// keeps LZ4 if fjall changes its default.
-///
-/// `memtable_size` is the size at which fjall flushes the keyspace's memtable.
-/// `None` keeps fjall's default.
-pub(super) fn keyspace_options(memtable_size: Option<ByteSize>) -> KeyspaceCreateOptions {
-    let mut options = KeyspaceCreateOptions::default()
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4));
-    if let Some(bytes) = memtable_size {
-        options = options.max_memtable_size(bytes.get());
-    }
-    options
+/// keeps LZ4 if fjall changes its default. The lifecycle task sets each
+/// keyspace's memtable size.
+pub(super) fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
 /// Internal errors raised while opening the local keyed-state cache.

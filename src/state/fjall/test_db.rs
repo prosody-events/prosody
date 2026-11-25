@@ -52,7 +52,7 @@ fn shared_database() -> Result<Database> {
 /// raw [`Keyspace`] (e.g. to read a stored row byte-for-byte).
 pub fn keyspace(name: &str) -> Result<(Database, Keyspace)> {
     let database = shared_database()?;
-    let keyspace = database.keyspace(name, || keyspace_options(None))?;
+    let keyspace = database.keyspace(name, keyspace_options)?;
     Ok((database, keyspace))
 }
 

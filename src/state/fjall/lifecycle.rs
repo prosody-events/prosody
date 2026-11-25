@@ -6,11 +6,17 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
+//! The task also divides the memtable budget. It gives each new keyspace an
+//! equal share for every partition that it holds or that waits for a create.
+//! A keyspace keeps its share until it is deleted, because fjall cannot change
+//! the memtable size of a live keyspace.
+//!
 //! The task holds only weak senders. It stops after the client and every
 //! assignment cache are gone, then drops the database on a blocking thread.
 //! fjall removes the whole database directory when that last handle drops.
 
 use super::{FjallCellCache, io};
+use crate::ByteSize;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::select;
@@ -85,17 +91,19 @@ impl Drop for Retire {
 }
 
 /// Starts the lifecycle task for `database` and returns its create and delete
-/// queues. The task creates each keyspace with `options`. The caller runs
-/// inside a Tokio runtime.
+/// queues. The task creates each keyspace with `options` and a share of the
+/// memtable `budget`. The caller runs inside a Tokio runtime.
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
+    budget: ByteSize,
 ) -> (UnboundedSender<Pending>, UnboundedSender<Keyspace>) {
     let (creates, create_rx) = unbounded_channel();
     let (retires, retire_rx) = unbounded_channel();
     tokio::spawn(run(
         database,
         options,
+        budget,
         create_rx,
         retire_rx,
         retires.downgrade(),
@@ -106,20 +114,32 @@ pub(super) fn spawn(
 /// Runs queued creates and deletes, one at a time and creates first. Returns
 /// after the client and every assignment cache are gone and both queues are
 /// empty. It then drops the last database handle on a blocking thread.
+///
+/// `live` counts the keyspaces that exist. A keyspace that waits for deletion
+/// still counts, so the count never falls below the partitions held.
 async fn run(
     database: Database,
     options: KeyspaceCreateOptions,
+    budget: ByteSize,
     mut creates: UnboundedReceiver<Pending>,
     mut retires: UnboundedReceiver<Keyspace>,
     retire_queue: WeakUnboundedSender<Keyspace>,
 ) {
+    let mut live: usize = 0;
     loop {
         select! {
             biased;
             Some(slot) = creates.recv() => {
-                create(&database, &options, slot, &retire_queue).await;
+                let partitions = live + creates.len() + 1;
+                let options = options.clone().max_memtable_size(memtable_share(budget, partitions));
+                if create(&database, options, slot, &retire_queue).await {
+                    live += 1;
+                }
             }
-            Some(keyspace) = retires.recv() => delete(&database, keyspace).await,
+            Some(keyspace) = retires.recv() => {
+                delete(&database, keyspace).await;
+                live = live.saturating_sub(1);
+            }
             else => break,
         }
     }
@@ -131,17 +151,19 @@ async fn run(
 /// ended drops the new cache, which queues the keyspace's deletion. After a
 /// failure the slot stays empty, so the assignment uses durable storage, as it
 /// does after the cache is disabled.
+///
+/// Returns whether a keyspace was created. Each created keyspace later reaches
+/// the delete queue.
 pub(super) async fn create(
     database: &Database,
-    options: &KeyspaceCreateOptions,
+    options: KeyspaceCreateOptions,
     slot: Pending,
     retire_queue: &WeakUnboundedSender<Keyspace>,
-) {
+) -> bool {
     let Some(queue) = retire_queue.upgrade().filter(|_| slot.strong_count() > 0) else {
-        return;
+        return false;
     };
     let opened = database.clone();
-    let options = options.clone();
     let created = io::blocking(move || {
         let mut name = Uuid::encode_buffer();
         let name = Uuid::new_v4().simple().encode_lower(&mut name);
@@ -159,11 +181,19 @@ pub(super) async fn create(
             if let Some(slot) = slot.upgrade() {
                 CacheSlot(slot).attach(cache);
             }
+            true
         }
         Err(error) => {
             warn!(%error, "keyed-state cache keyspace creation failed; the assignment uses durable storage");
+            false
         }
     }
+}
+
+/// Returns one keyspace's share of the memtable `budget` when `partitions`
+/// keyspaces share it. The shares never sum to more than the budget.
+pub(super) fn memtable_share(budget: ByteSize, partitions: usize) -> u64 {
+    budget.get() / u64::try_from(partitions.max(1)).unwrap_or(u64::MAX)
 }
 
 /// Deletes `keyspace`. A failure leaves it for the database drop to remove.

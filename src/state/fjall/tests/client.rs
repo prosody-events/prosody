@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::ByteSize;
-use crate::state::config::KeyedStateConfiguration;
+use crate::state::config::{DEFAULT_MEMTABLE_SIZE, KeyedStateConfiguration};
 use crate::state::fjall::client::{database_builder, keyspace_options};
-use crate::state::fjall::lifecycle::{create, delete};
+use crate::state::fjall::lifecycle::{create, delete, memtable_share};
 use fjall::Keyspace;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::HashMap;
@@ -62,9 +62,11 @@ impl Arbitrary for Trace {
 
 /// Lifecycle model: after the queued creates and deletes run, every live slot
 /// holds a keyspace, the database holds exactly those keyspaces, and no
-/// keyspace name serves two assignments. Revokes often land before the create
-/// runs, so the trace covers creates for assignments that already ended. The
-/// lifecycle task runs creates first, and this model does the same. Each
+/// keyspace name serves two assignments. The creates that report success,
+/// less the deletes, equal the keyspaces in the database. The lifecycle task
+/// divides the memtable budget by that count. Revokes often land before the
+/// create runs, so the trace covers creates for assignments that already ended.
+/// The lifecycle task runs creates first, and this model does the same. Each
 /// iteration first deletes the keyspaces that a failed iteration left, so a
 /// shrunk trace starts from an empty database.
 #[test]
@@ -77,7 +79,7 @@ fn prop_keyspaces_track_live_slots() {
                 Ok::<_, Report>((database, dir))
             })
             .await?;
-        let options = keyspace_options(None);
+        let options = keyspace_options();
         for name in keyspace_names(database) {
             database.delete_keyspace(database.keyspace(&name, || options.clone())?)?;
         }
@@ -85,6 +87,7 @@ fn prop_keyspaces_track_live_slots() {
         let mut creates = Vec::new();
         let mut live: Vec<(usize, CacheSlot)> = Vec::new();
         let mut owners: HashMap<String, usize> = HashMap::new();
+        let mut existing: usize = 0;
 
         for (step, op) in trace.0.iter().chain([&Op::Settle]).enumerate() {
             match op {
@@ -100,10 +103,16 @@ fn prop_keyspaces_track_live_slots() {
                 }
                 Op::Settle => {
                     for slot in creates.drain(..) {
-                        create(database, &options, slot, &queue.downgrade()).await;
+                        if create(database, options.clone(), slot, &queue.downgrade()).await {
+                            existing += 1;
+                        }
                     }
                     while let Ok(keyspace) = retired.try_recv() {
                         delete(database, keyspace).await;
+                        existing -= 1;
+                    }
+                    if existing != keyspace_names(database).len() {
+                        return Ok(false);
                     }
                     let mut held = BTreeSet::new();
                     for (id, slot) in &live {
@@ -165,6 +174,25 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     Ok(())
 }
 
+/// The memtable shares of `partitions` keyspaces never exceed the budget, and
+/// together they leave less than one byte per keyspace unused.
+#[test]
+fn prop_memtable_shares_fill_the_budget() {
+    fn prop(budget: u64, partitions: u16) -> TestResult {
+        let Some(budget) = NonZeroU64::new(budget) else {
+            return TestResult::discard();
+        };
+        let share = u128::from(memtable_share(
+            ByteSize::new(budget),
+            usize::from(partitions),
+        ));
+        let keyspaces = u128::from(partitions.max(1));
+        let unused = u128::from(budget.get()) - share * keyspaces;
+        TestResult::from_bool(unused < keyspaces)
+    }
+    QuickCheck::new().quickcheck(prop as fn(u64, u16) -> TestResult);
+}
+
 /// `owned_cache_size` sets fjall's block-cache capacity. `None` leaves the
 /// builder untouched, so it matches an untouched control database rather than
 /// a hardcoded fjall default. 7 MiB differs from that default.
@@ -190,7 +218,7 @@ fn config(cache_dir: &Path, cache_size: Option<ByteSize>) -> Result<KeyedStateCo
     Ok(KeyedStateConfiguration::builder()
         .cache_dir(cache_dir.to_path_buf())
         .owned_cache_size(cache_size)
-        .memtable_size(None)
+        .memtable_size(DEFAULT_MEMTABLE_SIZE)
         .build()?)
 }
 
